@@ -1,177 +1,155 @@
 #!/usr/bin/env python3
-import math
-import numpy as np
+"""
+scripts/train_classifier.py
+
+Train a multi-output violation classifier using pre-extracted annotations:
+- load detect_boxes.csv, keypoints.csv, depth.csv, age.csv, labels.csv
+- merge and compute the 15-dimensional geometric feature vector per person
+- train a HistGradientBoostingClassifier wrapped in MultiOutputClassifier
+- save the model to models/violation_classifier_balanced.pkl
+"""
+import os
 import pandas as pd
-from pathlib import Path
+import numpy as np
+import joblib
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import joblib
+from sklearn.metrics import classification_report, accuracy_score
 
-ALL_LABELS = ["OVERLOADING", "SIDE_SADDLE", "REVERSE_SIDE_SADDLE", "CHILD_IN_FRONT"]
+# ------------- Configuration ---------------
+SCRIPT_DIR  = os.path.dirname(__file__)
+PROJECT_ROOT= os.path.dirname(SCRIPT_DIR)
+ANNOT_DIR   = os.path.join(PROJECT_ROOT, 'annotations')
+MODEL_OUT   = os.path.join(PROJECT_ROOT, 'models', 'violation_classifier_balanced.pkl')
+TEST_SIZE   = 0.3
+RANDOM_SEED = 42
 
-def compute_iou(boxA, boxB):
-    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
-    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    if inter == 0:
-        return 0.0
-    areaA = (boxA[2]-boxA[0])*(boxA[3]-boxA[1])
-    areaB = (boxB[2]-boxB[0])*(boxB[3]-boxB[1])
-    return inter / float(areaA + areaB - inter + 1e-6)
+# ------------- Load annotation CSVs ----------
+print("📥 Loading CSVs from", ANNOT_DIR)
+detect_df = pd.read_csv(os.path.join(ANNOT_DIR, 'detect_boxes.csv'))
+kp_df     = pd.read_csv(os.path.join(ANNOT_DIR, 'keypoints.csv'))
+depth_df  = pd.read_csv(os.path.join(ANNOT_DIR, 'depth.csv'))
+age_df    = pd.read_csv(os.path.join(ANNOT_DIR, 'age.csv'))
+labels_df = pd.read_csv(os.path.join(ANNOT_DIR, 'labels.csv'))
 
-def angle3d(a, b, c):
-    v1 = np.array(a) - np.array(b)
-    v2 = np.array(c) - np.array(b)
-    cosang = np.dot(v1, v2) / (np.linalg.norm(v1)*np.linalg.norm(v2) + 1e-6)
-    cosang = max(-1.0, min(1.0, cosang))
-    return math.degrees(math.acos(cosang))
+# ------------- Prepare person & bike IDs -------
+persons = detect_df[detect_df['class']==0].copy()
+persons['person_id'] = persons.groupby('file').cumcount()
+bikes   = detect_df[detect_df['class']==3].copy()
+bikes['bike_id']    = bikes.groupby('file').cumcount()
 
-def main():
-    # ── Load all annotations
-    kps    = pd.read_csv("annotations/keypoints.csv")
-    labels = pd.read_csv("annotations/labels.csv").rename(columns={"filename":"file"})
-    det    = pd.read_csv("annotations/detect_boxes.csv")
-    depth  = pd.read_csv("annotations/depth.csv")
-    age    = pd.read_csv("annotations/age.csv")
+# ------------- Normalize labels ---------------
+# Merge SIDE_SADDLE and REVERSE_SIDE_SADDLE
+labels_df['SIDE_SADDLE'] = (
+    (labels_df['SIDE_SADDLE']==1) |
+    (labels_df['REVERSE_SIDE_SADDLE']==1)
+).astype(int)
+labels_df['PASSENGER_OVERLOAD'] = labels_df['OVERLOADING']
+labels_df['CHILD_FRONT']         = labels_df['CHILD_IN_FRONT']
+labels_df = labels_df[['file','PASSENGER_OVERLOAD','SIDE_SADDLE','CHILD_FRONT']]
 
-    # ── Split detections into persons vs motorcycles
-    persons = det[det["class"]==0].reset_index(drop=True)
-    motors  = det[det["class"]==3].reset_index(drop=True)
-    persons["person_id"] = persons.groupby("file").cumcount()
+# ------------- Merge all annotations ----------
+print("🔗 Merging annotations into one DataFrame...")
+df = kp_df.merge(
+    persons[['file','person_id','x1','y1','x2','y2']],
+    on=['file','person_id'], how='inner'
+).merge(
+    bikes[['file','x1','y1','x2','y2']].rename(
+        columns={'x1':'x1_bike','y1':'y1_bike','x2':'x2_bike','y2':'y2_bike'}
+    ),
+    on='file', how='left'
+).merge(
+    depth_df, on=['file','person_id'], how='left'
+).merge(
+    age_df,  on=['file','person_id'], how='left'
+).merge(
+    labels_df, on='file', how='left'
+)
 
-    # ── Merge base features
-    df = (
-        kps
-        .merge(persons, on=["file","person_id"], suffixes=("_kp","_box"))
-        .merge(depth,   on=["file","person_id"], how="left")
-        .merge(age,     on=["file","person_id"], how="left")
-    )
+# ------------- Feature computation -------------
+def compute_feature_vector(bbox_bike, bbox_person, kp, depth, age):
+    import numpy as _np
+    # helper for angle ∠ABC
+    def _angle(a,b,c):
+        BA = _np.array(a)-_np.array(b)
+        BC = _np.array(c)-_np.array(b)
+        cosang = _np.dot(BA,BC)/( _np.linalg.norm(BA)*_np.linalg.norm(BC)+1e-6 )
+        return _np.degrees(_np.arccos(_np.clip(cosang,-1,1)))
 
-    # ── Compute bbox features
-    df["bbox_width"]  = df["x2"] - df["x1"]
-    df["bbox_height"] = df["y2"] - df["y1"]
-    df["bbox_area"]   = df["bbox_width"] * df["bbox_height"]
+    # keypoints: dict i→(x,y,conf)
+    # angles
+    θ_R = _angle(kp[11][:2], kp[13][:2], kp[15][:2])
+    θ_L = _angle(kp[12][:2], kp[14][:2], kp[16][:2])
+    pel = _np.array(kp[11][:2]); sh = _np.array(kp[5][:2]); vert=_np.array([0,-1])
+    φ   = _np.degrees(_np.arccos(_np.dot(sh-pel,vert)/( _np.linalg.norm(sh-pel)*_np.linalg.norm(vert)+1e-6 )))
 
-    # ── Assign each person to a bike via IoU
-    def assign_bike(r):
-        bikes = motors[motors.file==r.file]
-        for bid, mb in bikes.iterrows():
-            if compute_iou([r.x1,r.y1,r.x2,r.y2],
-                           [mb.x1,mb.y1,mb.x2,mb.y2]) > 0.3:
-                return bid
-        return -1
-    df["bike_id"] = df.apply(assign_bike, axis=1)
+    # normalized measures by shoulder width
+    sh_w    = _np.linalg.norm(_np.array(kp[6][:2]) - _np.array(kp[5][:2]))+1e-6
+    hip_w   = _np.linalg.norm(_np.array(kp[11][:2]) - _np.array(kp[12][:2]))/sh_w
+    foot_drop  = (kp[15][1]-kp[11][1])/sh_w
+    torso_disp = (kp[5][1]-kp[11][1]) /sh_w
+    # normalized hip x-position
+    x_hip_norm = ((kp[11][0]+kp[12][0])/2) / (bbox_person[2]+1e-6)
 
-    # ── Riders per bike & on-cycle flag
-    df["persons_on_bike"]  = df.groupby(["file","bike_id"])["person_id"].transform("count")
-    df["is_on_motorcycle"] = (df["bike_id"] != -1).astype(int)
+    # handlebar proximity
+    handlebar_prox = abs(kp[5][0]-bbox_bike[0]) / sh_w
+    # arm-torso enclosure
+    d1 = _np.linalg.norm(_np.array(kp[7][:2]) - _np.array(kp[11][:2]))
+    d2 = _np.linalg.norm(_np.array(kp[4][:2]) - _np.array(kp[12][:2]))
+    arm_torso = min(d1,d2)/sh_w
 
-    # ── Pseudo-3D: replicate avg_depth into each kpt_z
-    for j in range(17):
-        df[f"kpt{j}_z"] = df["avg_depth"]
+    # ratios & counts
+    leg_vis     = int((kp[13][2]>0.25 and kp[15][2]>0.25) + (kp[14][2]>0.25 and kp[16][2]>0.25))
+    λ_torso     = torso_disp / (foot_drop + 1e-6)
+    sh_hip_ratio= sh_w/(hip_w*sh_w+1e-6)
+    Δθ          = abs(θ_L-θ_R)
+    head_w      = _np.linalg.norm(_np.array(kp[2][:2]) - _np.array(kp[1][:2]))/sh_w
+    hand_torso  = min(d1,d2)/sh_w
 
-    # ── Two extra pose angles for side-saddle (left) and reverse (right)
-    df["left_hip_angle"]  = df.apply(lambda r: angle3d(
-        (r.kpt5_x, r.kpt5_y, r.kpt5_z),
-        (r.kpt11_x,r.kpt11_y,r.kpt11_z),
-        (r.kpt13_x,r.kpt13_y,r.kpt13_z)
-    ), axis=1)
-    df["left_torso_lean"] = df.apply(lambda r: angle3d(
-        (r.kpt5_x, r.kpt5_y, r.kpt5_z),
-        (r.kpt11_x,r.kpt11_y,r.kpt11_z),
-        (r.kpt11_x,r.kpt11_y-1,r.kpt11_z)
-    ), axis=1)
-
-    df["right_hip_angle"]  = df.apply(lambda r: angle3d(
-        (r.kpt6_x, r.kpt6_y, r.kpt6_z),
-        (r.kpt12_x,r.kpt12_y,r.kpt12_z),
-        (r.kpt14_x,r.kpt14_y,r.kpt14_z)
-    ), axis=1)
-    df["right_torso_lean"] = df.apply(lambda r: angle3d(
-        (r.kpt6_x, r.kpt6_y, r.kpt6_z),
-        (r.kpt12_x,r.kpt12_y,r.kpt12_z),
-        (r.kpt12_x,r.kpt12_y-1,r.kpt12_z)
-    ), axis=1)
-
-    # ── Merge in ground-truth labels
-    df = df.merge(labels, on="file")
-
-    # ── Normalize all 17 keypoints (2D) about kpt11 (left hip) and scale by bbox_height
-    root_x = df["kpt11_x"]
-    root_y = df["kpt11_y"]
-    scale  = df["bbox_height"] + 1e-6
-
-    for j in range(17):
-        df[f"kpt{j}_xn"] = (df[f"kpt{j}_x"] - root_x) / scale
-        df[f"kpt{j}_yn"] = (df[f"kpt{j}_y"] - root_y) / scale
-        # optional confidences (you can include these too):
-        df[f"kpt{j}_vn"] = df[f"kpt{j}_v"]
-
-    # ── Extras: symmetry, helmet flag, front-half overlap
-    df["shoulder_diff"] = (df.kpt5_y - df.kpt6_y).abs() / scale
-    df["hip_diff"]      = (df.kpt11_y - df.kpt12_y).abs() / scale
-
-    df["head_seat_ratio"] = (df.kpt0_y - df.kpt11_y) / scale
-
-    def front_overlap(r):
-        bikes = motors[motors.file==r.file].reset_index(drop=True)
-        bid = r.bike_id
-        if bid<0 or bid>=len(bikes):
-            return 0.0
-        mb = bikes.loc[bid]
-        midx = (mb.x1+mb.x2)/2.0
-        ix1, iy1 = max(r.x1,mb.x1), max(r.y1,mb.y1)
-        ix2, iy2 = min(r.x2,midx),   min(r.y2,mb.y2)
-        inter = max(0, ix2-ix1)*max(0, iy2-iy1)
-        area  = (r.x2-r.x1)*(r.y2-r.y1) + 1e-6
-        return inter/area
-
-    df["front_half_overlap"] = df.apply(front_overlap, axis=1)
-    df["helmet"] = df["age"].fillna(-1).lt(0).astype(int)
-
-    # ── Build feature matrix X and target y
-    kpt2d_norm = [f"kpt{j}_{s}" for j in range(17) for s in ("xn","yn","vn")]
-    kpt3d      = [f"kpt{j}_z" for j in range(17)]
-    extras     = [
-        "bbox_width","bbox_height","bbox_area",
-        "avg_depth","age",
-        "persons_on_bike","is_on_motorcycle",
-        "left_hip_angle","left_torso_lean",
-        "right_hip_angle","right_torso_lean",
-        "shoulder_diff","hip_diff",
-        "head_seat_ratio","front_half_overlap","helmet"
+    return [
+        θ_R, θ_L, φ, hip_w, foot_drop, x_hip_norm,
+        torso_disp, handlebar_prox, arm_torso, leg_vis,
+        λ_torso, sh_hip_ratio, Δθ, head_w, hand_torso
     ]
 
-    X = df[kpt2d_norm + kpt3d + extras].fillna(-1)
-    y = df[ALL_LABELS]
+print("⚙️ Computing features & labels...")
+X, Y = [], []
+for _, row in df.iterrows():
+    # build keypoint dict
+    kp = {i:(row[f'kpt{i}_x'], row[f'kpt{i}_y'], row[f'kpt{i}_v']) for i in range(17)}
+    bbox_p = [row['x1'],row['y1'],row['x2'],row['y2']]
+    bbox_b = [row['x1_bike'],row['y1_bike'],row['x2_bike'],row['y2_bike']]
+    depth  = row.get('avg_depth', -1)
+    age    = row.get('age', -1)
 
-    # ── Train/test split
-    Xtr, Xte, ytr, yte = train_test_split(
-        X, y, test_size=0.2, random_state=42,
-        stratify=y["OVERLOADING"]
-    )
+    X.append(compute_feature_vector(bbox_b, bbox_p, kp, depth, age))
+    Y.append([row['PASSENGER_OVERLOAD'], row['SIDE_SADDLE'], row['CHILD_FRONT']])
 
-    # ── Multi-output HGB
-    base = HistGradientBoostingClassifier(
-        max_iter=1000,
-        class_weight="balanced",
-        random_state=42
-    )
-    clf = MultiOutputClassifier(base, n_jobs=-1)
+X = np.array(X)
+Y = np.array(Y)
 
-    print("🧠 Training...")
-    clf.fit(Xtr, ytr)
+# ------------- Split, Train, Evaluate -------------
 
-    print("===== EVALUATION on test set =====")
-    ypred = clf.predict(Xte)
-    print(classification_report(yte, ypred, target_names=ALL_LABELS, zero_division=0))
+print(f"Split {len(X)} samples → train/test {1-TEST_SIZE:.0%}/{TEST_SIZE:.0%}")
+Xtr, Xte, ytr, yte = train_test_split(
+    X, Y, test_size=TEST_SIZE, random_state=RANDOM_SEED,
+)
 
-    # ── Save model
-    Path("models").mkdir(exist_ok=True)
-    joblib.dump(clf, "models/violation_classifier_balanced.pkl")
-    print("✅ Saved to models/violation_classifier_balanced.pkl")
+print("🤖 Training multi-output HistGradientBoostingClassifier...")
+clf = MultiOutputClassifier(
+    HistGradientBoostingClassifier(random_state=RANDOM_SEED)
+)
+clf.fit(Xtr, ytr)
 
-if __name__=="__main__":
-    main()
+print("\n📊 Classification report on test set:")
+ypred = clf.predict(Xte)
+print(classification_report(yte, ypred,
+      target_names=['OVERLOAD','SIDE_SADDLE','CHILD_FRONT'],
+      zero_division=0))
+print("Overall accuracy:", accuracy_score(yte, ypred))
+
+# ------------- Save Model ------------------------
+os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
+joblib.dump(clf, MODEL_OUT)
+print(f"✅ Saved trained classifier to {MODEL_OUT}")
