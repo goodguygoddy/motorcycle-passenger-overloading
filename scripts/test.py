@@ -45,10 +45,7 @@ def is_side_saddle(r):
     else:
         return (r['torso_pitch'] < 20 and r['torso_disp'] < 0.4)
 
-def is_child_front(r):
-    return (r['torso_pitch'] > 30 and r['torso_leg_ratio'] < 0.5 and r['handlebar_prox'] < 50)
-
-# Compute 15-dim feature vector
+# Compute 14-dim feature vector
 def compute_feature_vector(kp, bbox_p, bbox_b):
     import numpy as _np
     def _angle(a, b, c):
@@ -61,7 +58,8 @@ def compute_feature_vector(kp, bbox_p, bbox_b):
     θ_L = _angle(kp[12][:2], kp[14][:2], kp[16][:2])
     pel, sh = _np.array(kp[11][:2]), _np.array(kp[5][:2])
     vert = _np.array([0, -1])
-    φ   = _np.degrees(_np.arccos(_np.dot(sh-pel, vert) / (_np.linalg.norm(sh-pel)*_np.linalg.norm(vert)+1e-6)))
+    φ   = _np.degrees(_np.arccos(_np.dot(sh-pel, vert) / 
+                        (_np.linalg.norm(sh-pel)*_np.linalg.norm(vert)+1e-6)))
 
     sh_w = _np.linalg.norm(_np.array(kp[6][:2]) - _np.array(kp[5][:2])) + 1e-6
     hip_w = _np.linalg.norm(_np.array(kp[11][:2]) - _np.array(kp[12][:2])) / sh_w
@@ -69,12 +67,12 @@ def compute_feature_vector(kp, bbox_p, bbox_b):
     torso_disp  = (kp[5][1]  - kp[11][1]) / sh_w
     x_hip_norm  = ((kp[11][0] + kp[12][0]) / 2) / (bbox_p[2] + 1e-6)
 
-    handlebar_prox = abs(kp[5][0] - bbox_b[0]) / sh_w
     d1 = _np.linalg.norm(_np.array(kp[7][:2])  - _np.array(kp[11][:2]))
     d2 = _np.linalg.norm(_np.array(kp[4][:2])  - _np.array(kp[12][:2]))
-    arm_torso = min(d1, d2) / sh_w
+    arm_torso   = min(d1, d2) / sh_w
 
-    leg_vis           = int((kp[13][2]>0.25 and kp[15][2]>0.25) + (kp[14][2]>0.25 and kp[16][2]>0.25))
+    leg_vis           = int((kp[13][2]>0.25 and kp[15][2]>0.25) + \
+                            (kp[14][2]>0.25 and kp[16][2]>0.25))
     torso_leg_ratio   = torso_disp / (foot_drop + 1e-6)
     shoulder_hip_ratio= sh_w / (hip_w * sh_w + 1e-6)
     leg_asym          = abs(θ_L - θ_R)
@@ -82,12 +80,20 @@ def compute_feature_vector(kp, bbox_p, bbox_b):
     hand_torso        = min(d1, d2) / sh_w
 
     return {
-        'theta_R': θ_R, 'theta_L': θ_L, 'torso_pitch': φ,
-        'hip_width': hip_w, 'foot_drop': foot_drop, 'x_hip_norm': x_hip_norm,
-        'torso_disp': torso_disp, 'handlebar_prox': handlebar_prox,
-        'arm_torso': arm_torso, 'leg_vis': leg_vis,
-        'torso_leg_ratio': torso_leg_ratio, 'shoulder_hip_ratio': shoulder_hip_ratio,
-        'leg_asym': leg_asym, 'head_w': head_w, 'hand_torso': hand_torso
+        'theta_R': θ_R,
+        'theta_L': θ_L,
+        'torso_pitch': φ,
+        'hip_width': hip_w,
+        'foot_drop': foot_drop,
+        'x_hip_norm': x_hip_norm,
+        'torso_disp': torso_disp,
+        'arm_torso': arm_torso,
+        'leg_vis': leg_vis,
+        'torso_leg_ratio': torso_leg_ratio,
+        'shoulder_hip_ratio': shoulder_hip_ratio,
+        'leg_asym': leg_asym,
+        'head_w': head_w,
+        'hand_torso': hand_torso
     }
 
 # Process a single image
@@ -114,7 +120,7 @@ def process_image(img_path, det_model, pose_model, clf):
         res = pose_model(crop, conf=0.25)[0]
         kp_xy = res.keypoints.xy[0].cpu().numpy() + [x1, y1]
         kp_cf = res.keypoints.conf[0].cpu().numpy()
-        kp    = {idx: (float(kp_xy[idx][0]), float(kp_xy[idx][1]), float(kp_cf[idx]))
+        kp    = {idx: (float(kp_xy[idx][0]), float(kp_xy[idx][1]), float(kp_cf[idx]))  
                  for idx in range(len(kp_cf))}
 
         # Draw pose skeleton
@@ -138,14 +144,14 @@ def process_image(img_path, det_model, pose_model, clf):
 
         # Features & classification
         feats = compute_feature_vector(kp, pbox.tolist(), bike_bbox)
-        x    = np.array([list(feats.values())])
-        probs= clf.predict_proba(x)
+        x     = np.array([list(feats.values())])
+        probs = clf.predict_proba(x)
         p_side  = probs[0][0][1]
         p_child = probs[1][0][1]
         side_pred  = p_side  > THR_SIDE_SADDLE
         child_pred = p_child > THR_CHILD_FRONT
         side_final  = side_pred  and is_side_saddle(feats)
-        child_final = child_pred and is_child_front(feats)
+        child_final = child_pred
         overload    = riders_on_bike >= 3
 
         print(f"➡️ Person {i}:")
